@@ -1,0 +1,28 @@
+- name: ManagedIdentityId
+  type: string
+- name: ServiceBusName
+  type: string
+- name: ServiceBusQueueName
+  type: string
+- name: DatadiskName
+  type: string
+
+steps:
+- task: PowerShell@2
+  name: UnassignDataDisk
+  displayName: Unassign Data Disk
+  condition: always()
+  inputs:
+    targetType: 'inline'
+    script: |
+      if('${{parameters.DatadiskName}}' -like '*-data-*'){
+        $response = Invoke-WebRequest -Uri "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2F${{parameters.ServiceBusName}}.servicebus.windows.net%2F&client_id=${{parameters.ManagedIdentityId}}" -Headers @{Metadata="true"} -UseBasicParsing
+        $content = $response.Content | ConvertFrom-Json
+        $access_token = $content.access_token
+        $body = '${{parameters.DatadiskName}}'
+        Write-Output "Adding disk $body to the queue"
+        $sendmessage = Invoke-WebRequest -Method POST -Uri "https://${{parameters.ServiceBusName}}.servicebus.windows.net/${{parameters.ServiceBusQueueName}}/messages" -Headers @{'Authorization'="Bearer $access_token";'Content-Type'='text/plain'} -Body $body -ContentType 'text/plain' -UseBasicParsing
+      }
+      else{
+        Write-Output "Provided disk name not valid: ${{parameters.DatadiskName}}"
+      }
