@@ -1,0 +1,91 @@
+parameters:
+- name: ManagedIdentityId
+  type: string
+- name: SubscriptionId
+  type: string
+- name: ScaleSetResourceGroup
+  type: string
+- name: ServiceBusResourceGroup
+  type: string
+- name: ServiceBusName
+  type: string
+- name: ServiceBusQueueName
+  type: string
+
+steps:
+- task: PowerShell@2
+  name: GetDataDisk
+  displayName: Get Data Disk
+  inputs:
+    targetType: 'inline'
+    script: |
+      try{
+        Connect-AzAccount -Identity -AccountId ${{parameters.ManagedIdentityId}}
+        Select-AzSubscription -SubscriptionId ${{parameters.SubscriptionId}}
+        $vm = Get-AzVm -resourcegroupname ${{parameters.ScaleSetResourceGroup}} | Where-Object { $_.OsProfile.ComputerName -eq "$(Agent.Name)" }
+        $vmssvm = Get-AzVm -resourcegroupname ${{parameters.ScaleSetResourceGroup}} -name $vm.name
+        if ($vmssvm.StorageProfile.DataDisks.count -eq 0){
+          $queue = Get-AzServiceBusQueue -ResourceGroup ${{parameters.ServiceBusResourceGroup}} -NamespaceName ${{parameters.ServiceBusName}} -QueueName ${{parameters.ServiceBusQueueName}}
+          if ($queue.CountDetailActiveMessageCount -gt 0){
+            foreach($iter in 1..3) {
+              try {
+                $response = Invoke-WebRequest -Uri "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2F${{parameters.ServiceBusName}}.servicebus.windows.net%2F&client_id=${{parameters.ManagedIdentityId}}" -Headers @{Metadata="true"} -UseBasicParsing
+                $content =$response.Content | ConvertFrom-Json
+                $access_token = $content.access_token
+                $message = Invoke-WebRequest -Method Delete -Uri "https://${{parameters.ServiceBusName}}.servicebus.windows.net/${{parameters.ServiceBusQueueName}}/messages/head" -Headers @{'Authorization'="Bearer $access_token"} -UseBasicParsing
+                break
+              } catch {
+                Write-Host "Failed to get datadisk from service bus: $_"
+                if($iter -ne 3){
+                  Write-Host "Retrying..."
+                  Start-Sleep -Seconds $(10 * $iter)
+                }
+              }
+            }
+            if($message.StatusCode -eq 200){
+              $diskName = $message.Content
+              $disk = Get-AzDisk -ResourceGroupName ${{parameters.ScaleSetResourceGroup}} -Name $diskName
+              if (($disk.DiskState -eq 'Unattached')){
+                Add-AzVmDataDisk -VM $vmssvm -Lun 0 -CreateOption Attach -ManagedDiskId $disk.Id
+                Update-AzVm -VM $VmssVM -ResourceGroupName ${{parameters.ScaleSetResourceGroup}}
+                Write-Output "Assigning disk $diskName"
+                Write-Host "##vso[task.setvariable variable=BuildDataDisk]$diskName"
+                Start-Sleep 60
+                if(-not(Test-Path E:\ -ErrorAction SilentlyContinue)){
+                  Write-Output "Data disk not set as E Drive, will attempt to reassign"
+                  # Reassign DVD Drive if it is already using E
+                  if((Get-Volume -DriveLetter E -ErrorAction SilentlyContinue).DriveType -eq 'CD-ROM'){
+                    Write-Host "DVD Drive is using E:, reassigning"
+                    $dvd = Get-CimInstance -ClassName Win32_Volume -Filter "DriveLetter = 'E:'"
+                    $dvd | Set-CimInstance -Property @{DriveLetter = 'Z:'}
+                  }
+                  # Find Data Label and assign to E
+                  $driveletter = (Get-Volume | Where-Object { $_.FileSystemLabel -eq 'Data' }).DriveLetter
+                  Get-Partition -DriveLetter $driveletter | Set-Partition -NewDriveLetter E
+                }
+                Break
+              }
+              else{
+                Write-Output "Disk $diskName is already in use!"
+                Exit -1
+              }
+            }
+            else{
+              Write-Host "Bad Message response from Service Bus Queue!"
+              Exit -1
+            }
+          }
+          else{
+            Write-Host "No Data Disks available to mount!"
+            Exit -1
+          }
+        }
+        else{
+          Write-Host "Agent already has a data disk attached!"
+          Exit -1
+        }
+      }
+      catch{
+        Write-Output "Unhandled Exception: $_"
+        Exit -1
+      }
