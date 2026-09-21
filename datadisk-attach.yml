@@ -1,0 +1,45 @@
+# Requires "BuildDataDisk" variable in calling pipeline e.g. `BuildDataDisk: $[dependencies.Prep.outputs['GetP4Disk.BuildDataDisk'] ]`
+
+parameters:
+- name: ManagedIdentityId
+  type: string
+- name: SubscriptionId
+  type: string
+- name: ScaleSetResourceGroup
+  type: string
+
+steps:
+- task: PowerShell@2
+  name: AttachDataDisk
+  displayName: Attach Data Disk
+  retryCountOnTaskFailure: 2
+  inputs:
+    targetType: 'inline'
+    script: |
+        Connect-AzAccount -Identity -AccountId ${{parameters.ManagedIdentityId}}
+        Select-AzSubscription -SubscriptionId ${{parameters.SubscriptionId}}
+        $vm = Get-AzVm -resourcegroupname ${{parameters.ScaleSetResourceGroup}} | Where-Object { $_.OsProfile.ComputerName -eq "$(Agent.Name)" }
+        $vmssvm = Get-AzVm -resourcegroupname ${{parameters.ScaleSetResourceGroup}} -name $vm.name
+      if ($vmssvm.StorageProfile.DataDisks.count -eq 0){
+        $disk = Get-AzDisk -ResourceGroupName ${{parameters.ScaleSetResourceGroup}} -Name $(BuildDataDisk)
+        Add-AzVmDataDisk -VM $vmssvm -Lun 0 -CreateOption Attach -ManagedDiskId $disk.Id
+        Update-AzVm -VM $VmssVM -ResourceGroupName ${{parameters.ScaleSetResourceGroup}}
+        Write-Output "Attached $(BuildDataDisk)"
+        Start-Sleep 60
+        if(-not(Test-Path E:\ -ErrorAction SilentlyContinue)){
+          Write-Output "Data disk not set as E Drive, will attempt to reassign"
+          # Reassign DVD Drive if it is already using E
+          if((Get-Volume -DriveLetter E -ErrorAction SilentlyContinue).DriveType -eq 'CD-ROM'){
+            Write-Host "DVD Drive is using E:, reassigning"
+            $dvd = Get-CimInstance -ClassName Win32_Volume -Filter "DriveLetter = 'E:'"
+            $dvd | Set-CimInstance -Property @{DriveLetter = 'Z:'}
+          }
+          # Find P4Data and assign to E
+          $driveletter = (Get-Volume | Where { $_.FileSystemLabel -eq 'P4Data' }).DriveLetter
+          Get-Partition -DriveLetter $driveletter | Set-Partition -NewDriveLetter E
+        }
+      }
+      else {
+        Write-Host "Disk already attached!"
+        Exit -1
+      }
