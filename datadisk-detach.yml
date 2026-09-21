@@ -1,0 +1,38 @@
+parameters:
+- name: ManagedIdentityId
+  type: string
+- name: SubscriptionId
+  type: string
+- name: ScaleSetResourceGroup
+  type: string
+
+steps:
+- task: PowerShell@2
+  name: GetDataDisk
+  displayName: Get Data Disk
+  inputs:
+    targetType: 'inline'
+    script: |
+      # Added Sleep timer. During quick attach > write data > detach operations not all data seems to persist to the data disk. Pause seems to let the data settle correctly.
+      Start-Sleep -Seconds 60
+      try{
+        Connect-AzAccount -Identity -AccountId ${{parameters.ManagedIdentityId}}
+        Select-AzSubscription -SubscriptionId ${{parameters.SubscriptionId}}
+        $vm = Get-AzVm -resourcegroupname ${{parameters.ScaleSetResourceGroup}} | Where-Object { $_.OsProfile.ComputerName -eq "$(Agent.Name)" }
+        $vmssVm = Get-AzVm -resourcegroupname ${{parameters.ScaleSetResourceGroup}} -name $vm.name
+        if ($vmssVm.StorageProfile.DataDisks.count -gt 0){
+          $disk = Get-AzDisk -ResourceGroupName ${{parameters.ScaleSetResourceGroup}} -Name $vmssVm.StorageProfile.DataDisks[0].Name
+          $diskName = $disk.Name
+          Remove-AzVmDataDisk -VM $vmssVm -DataDiskNames $diskName
+          Update-AzVm -VM $vmssVm -ResourceGroupName ${{parameters.ScaleSetResourceGroup}}
+          Write-Output "Detached $diskname"
+        }
+        else{
+          Write-Host "No data disk attached!"
+          Exit -1
+        }
+      }
+      catch{
+        Write-Output "Unhandled Exception: $_"
+        Exit -1
+      }
